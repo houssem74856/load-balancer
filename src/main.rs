@@ -19,7 +19,7 @@ use hyper::service::service_fn;
 use hyper::{Method, Request, Response};
 use hyper_util::rt::TokioIo;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
 use std::time::Duration;
 use tokio::net::TcpListener;
 
@@ -44,6 +44,42 @@ const RETRIABLE_METHODS: &[Method] = &[
 static INDEX: AtomicUsize = AtomicUsize::new(0);
 const MAX_RETRY_ATTEMPTS_FOR_GET_CONNECTION: u8 = 3;
 
+pub struct RetryBudget {
+    tokens: AtomicU8,
+    max_tokens: u8,
+    retry_cost: u8,
+}
+
+impl RetryBudget {
+    pub fn new(max_tokens: u8, retry_cost: u8) -> Self {
+        RetryBudget {
+            tokens: AtomicU8::new(max_tokens),
+            max_tokens,
+            retry_cost,
+        }
+    }
+
+    pub fn deposit(&self) {
+        let _ = self
+            .tokens
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |t| {
+                Some(t.saturating_add(1).min(self.max_tokens))
+            });
+    }
+
+    pub fn try_withdraw(&self) -> bool {
+        self.tokens
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |t| {
+                if t >= self.retry_cost {
+                    Some(t - self.retry_cost)
+                } else {
+                    None
+                }
+            })
+            .is_ok()
+    }
+}
+
 enum ConnectionError {
     NoHealthyBackend,
     CouldNotConnect,
@@ -52,12 +88,19 @@ enum ConnectionError {
 async fn get_connection<'a>(
     backends: &'a Vec<Backend>,
     connection_pools: &ConnectionPools,
+    tried_backends: &mut Vec<&'a String>,
+    retry_budget: &RetryBudget,
 ) -> Result<(SendRequest<BoxBody<Bytes, hyper::Error>>, &'a Backend), ConnectionError> {
     let mut connection_result = None;
-    for _ in 0..MAX_RETRY_ATTEMPTS_FOR_GET_CONNECTION {
+    let mut attempt_idx = 0;
+    while (tried_backends.len() as u8) < MAX_RETRY_ATTEMPTS_FOR_GET_CONNECTION {
+        if attempt_idx > 0 && !retry_budget.try_withdraw() {
+            break;
+        }
+        attempt_idx += 1;
         let healthy_backends = backends
             .iter()
-            .filter(|b| b.healthy.load(Ordering::Relaxed))
+            .filter(|b| !tried_backends.contains(&&b.addr) && b.healthy.load(Ordering::Relaxed))
             .collect::<Vec<_>>();
 
         if healthy_backends.is_empty() {
@@ -76,6 +119,8 @@ async fn get_connection<'a>(
             }
             Err(e) => {
                 eprintln!("failed to get connection to {}: {:?}", backend.addr, e);
+
+                tried_backends.push(&backend.addr);
 
                 if backend.consecutive_failures.fetch_add(1, Ordering::Relaxed) + 1
                     >= MAX_CONSECUTIVE_FAILURES_FOR_A_BACKEND
@@ -96,6 +141,7 @@ async fn handle_connection(
     req: Request<hyper::body::Incoming>,
     backends: Arc<Vec<Backend>>,
     connection_pools: Arc<ConnectionPools>,
+    retry_budget: Arc<RetryBudget>,
 ) -> Result<Response<BoxBody<Bytes, hyper::Error>>, Box<dyn std::error::Error + Send + Sync>> {
     //note: using BoxBody so I can return Incoming (streaming) to the client, while also being able to return Full responses for stuff like no healthy backend and stuff, which can't be done with Incoming only
     println!("{:?}", req);
@@ -104,6 +150,8 @@ async fn handle_connection(
         eprintln!("no healthy backend available");
         return Ok(error_response(503, "no healthy backend available"));
     }
+
+    retry_budget.deposit();
 
     let (parts, body) = req.into_parts();
     let retriable = RETRIABLE_METHODS.contains(&parts.method);
@@ -128,8 +176,20 @@ async fn handle_connection(
     let mut req;
     let (mut res, mut sender, mut backend, mut last_error) = (None, None, None, None);
     let attempts_allowed = body.max_attempts();
-    for _ in 0..attempts_allowed {
-        (sender, backend) = match get_connection(&backends, &connection_pools).await {
+    let mut tried_backends = Vec::new();
+    for attempt_idx in 0..attempts_allowed {
+        if attempt_idx > 0 && !retry_budget.try_withdraw() {
+            break;
+        }
+
+        (sender, backend) = match get_connection(
+            &backends,
+            &connection_pools,
+            &mut tried_backends,
+            &retry_budget,
+        )
+        .await
+        {
             Ok((sender, backend)) => (Some(sender), Some(backend)),
             Err(ConnectionError::NoHealthyBackend) => {
                 return Ok(error_response(503, "no healthy backend available"));
@@ -167,6 +227,8 @@ async fn handle_connection(
             Ok(Err(e)) => {
                 eprintln!("sending request to {} failed: {:?}", backend_addr, e);
 
+                tried_backends.push(backend_addr);
+
                 if backend_consecutive_failures.fetch_add(1, Ordering::Relaxed) + 1
                     >= MAX_CONSECUTIVE_FAILURES_FOR_A_BACKEND
                 {
@@ -176,6 +238,8 @@ async fn handle_connection(
             }
             Err(_) => {
                 eprintln!("request to {} timed out", backend_addr);
+
+                tried_backends.push(backend_addr);
 
                 if backend_consecutive_failures.fetch_add(1, Ordering::Relaxed) + 1
                     >= MAX_CONSECUTIVE_FAILURES_FOR_A_BACKEND
@@ -213,6 +277,7 @@ async fn handle_connection(
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let retry_budget = Arc::new(RetryBudget::new(100, 10));
     let addr = SocketAddr::from(([127, 0, 0, 1], 3000));
     let listener = TcpListener::bind(addr).await?;
 
@@ -243,10 +308,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let io = TokioIo::new(stream);
         let backends = Arc::clone(&backends);
         let connection_pools = Arc::clone(&connection_pools);
+        let retry_budget = Arc::clone(&retry_budget);
 
         tokio::task::spawn(async move {
             let service = service_fn(move |req| {
-                handle_connection(req, Arc::clone(&backends), Arc::clone(&connection_pools))
+                handle_connection(
+                    req,
+                    Arc::clone(&backends),
+                    Arc::clone(&connection_pools),
+                    Arc::clone(&retry_budget),
+                )
             });
 
             if let Err(err) = http1::Builder::new().serve_connection(io, service).await {
