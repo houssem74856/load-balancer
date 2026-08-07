@@ -100,6 +100,11 @@ async fn handle_connection(
     //note: using BoxBody so I can return Incoming (streaming) to the client, while also being able to return Full responses for stuff like no healthy backend and stuff, which can't be done with Incoming only
     println!("{:?}", req);
 
+    if !backends.iter().any(|b| b.healthy.load(Ordering::Relaxed)) {
+        eprintln!("no healthy backend available");
+        return Ok(error_response(503, "no healthy backend available"));
+    }
+
     let (parts, body) = req.into_parts();
     let retriable = RETRIABLE_METHODS.contains(&parts.method);
 
