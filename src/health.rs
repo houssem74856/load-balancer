@@ -1,17 +1,27 @@
 use crate::{backend::Backend, pool::ConnectionPools};
 
 use http_body_util::{BodyExt, Empty};
-use hyper::Request;
-use hyper::body::Bytes;
+use hyper::body::{Bytes, Incoming};
+use hyper::{Request, Response};
 use hyper_util::rt::TokioIo;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 use tokio::net::TcpStream;
 
+const HEALTH_CHECK_PATH: &str = "/";
+const HEALTH_CHECK_CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
+const HEALTH_CHECK_RESPONSE_TIMEOUT: Duration = Duration::from_secs(2);
+const CONSECUTIVE_SUCCESSES_TO_MARK_HEALTHY: u8 = 3;
+const CONSECUTIVE_FAILURES_TO_MARK_UNHEALTHY: u8 = 1;
+
+fn response_validator(res: Response<Incoming>) -> bool {
+    res.status().is_success()
+}
+
 async fn http_health_check(backend_addr: &str) -> bool {
     let stream = match tokio::time::timeout(
-        Duration::from_secs(3),
+        HEALTH_CHECK_CONNECT_TIMEOUT,
         TcpStream::connect(backend_addr),
     )
     .await
@@ -33,13 +43,13 @@ async fn http_health_check(backend_addr: &str) -> bool {
 
     let req = Request::builder()
         .method("GET")
-        .uri("/")
+        .uri(HEALTH_CHECK_PATH)
         .header("Host", backend_addr)
         .body(Empty::<Bytes>::new().map_err(|e| match e {}).boxed())
         .unwrap();
 
-    match tokio::time::timeout(Duration::from_secs(5), sender.send_request(req)).await {
-        Ok(Ok(res)) => res.status().is_success(),
+    match tokio::time::timeout(HEALTH_CHECK_RESPONSE_TIMEOUT, sender.send_request(req)).await {
+        Ok(Ok(res)) => response_validator(res),
         _ => false,
     }
 }
@@ -67,22 +77,56 @@ pub async fn start_health_checker(
         }
 
         for (backend, handle) in backends.iter().zip(handles) {
-            let healthy = handle.await.unwrap();
+            let passed = handle.await.unwrap();
             let was_healthy = backend.healthy.load(Ordering::Relaxed);
-            if was_healthy != healthy {
-                if healthy {
-                    println!("backend {} {}", backend.addr, "is back up");
+            let consecutive_successes = backend
+                .health_check_consecutive_successes
+                .load(Ordering::Relaxed);
+            let consecutive_failures = backend
+                .health_check_consecutive_failures
+                .load(Ordering::Relaxed);
 
-                    backend.consecutive_failures.store(0, Ordering::Relaxed);
-                } else {
-                    eprintln!("backend {} {}", backend.addr, "went down");
+            if passed {
+                if !was_healthy {
+                    let new_consecutive_successes = consecutive_successes.saturating_add(1);
+                    backend
+                        .health_check_consecutive_successes
+                        .store(new_consecutive_successes, Ordering::Relaxed);
+                    if new_consecutive_successes >= CONSECUTIVE_SUCCESSES_TO_MARK_HEALTHY {
+                        println!("backend {} {}", backend.addr, "is back up");
 
-                    connection_pools
-                        .empty_backend_connections(&backend.addr)
-                        .await
+                        backend.healthy.store(true, Ordering::Relaxed);
+                        backend
+                            .health_check_consecutive_successes
+                            .store(0, Ordering::Relaxed);
+                        backend
+                            .health_check_consecutive_failures
+                            .store(0, Ordering::Relaxed);
+                        backend.consecutive_failures.store(0, Ordering::Relaxed);
+                    }
+                }
+            } else {
+                if was_healthy {
+                    let new_consecutive_failures = consecutive_failures.saturating_add(1);
+                    backend
+                        .health_check_consecutive_failures
+                        .store(new_consecutive_failures, Ordering::Relaxed);
+                    if new_consecutive_failures >= CONSECUTIVE_FAILURES_TO_MARK_UNHEALTHY {
+                        eprintln!("backend {} {}", backend.addr, "went down");
+
+                        backend.healthy.store(false, Ordering::Relaxed);
+                        backend
+                            .health_check_consecutive_successes
+                            .store(0, Ordering::Relaxed);
+                        backend
+                            .health_check_consecutive_failures
+                            .store(0, Ordering::Relaxed);
+                        connection_pools
+                            .empty_backend_connections(&backend.addr)
+                            .await
+                    }
                 }
             }
-            backend.healthy.store(healthy, Ordering::Relaxed);
         }
     }
 }

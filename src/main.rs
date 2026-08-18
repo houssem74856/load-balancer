@@ -8,8 +8,6 @@ use crate::body::{RequestBody, handle_body};
 use crate::health::start_health_checker;
 use crate::pool::ConnectionPools;
 
-use std::net::SocketAddr;
-
 use http_body_util::Empty;
 use http_body_util::{BodyExt, Full, combinators::BoxBody};
 use hyper::body::Bytes;
@@ -18,9 +16,13 @@ use hyper::server::conn::http1;
 use hyper::service::service_fn;
 use hyper::{Method, Request, Response};
 use hyper_util::rt::TokioIo;
+use std::net::SocketAddr;
+use std::println;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
 use std::time::Duration;
+use tokio::io::AsyncReadExt;
+use tokio::io::AsyncWriteExt;
 use tokio::net::TcpListener;
 
 fn error_response(status: u16, msg: &str) -> Response<BoxBody<Bytes, hyper::Error>> {
@@ -81,7 +83,7 @@ impl RetryBudget {
 }
 
 enum ConnectionError {
-    NoHealthyBackend,
+    NoEnabledHealthyBackend,
     CouldNotConnect,
 }
 
@@ -98,18 +100,18 @@ async fn get_connection<'a>(
             break;
         }
         attempt_idx += 1;
-        let healthy_backends = backends
+        let ready_for_use_backends = backends
             .iter()
-            .filter(|b| !tried_backends.contains(&&b.addr) && b.healthy.load(Ordering::Relaxed))
+            .filter(|b| !tried_backends.contains(&&b.addr) && b.is_enabled_and_healthy())
             .collect::<Vec<_>>();
 
-        if healthy_backends.is_empty() {
-            eprintln!("no healthy backend available");
-            return Err(ConnectionError::NoHealthyBackend);
+        if ready_for_use_backends.is_empty() {
+            eprintln!("no enabled healthy backend available");
+            return Err(ConnectionError::NoEnabledHealthyBackend);
         }
 
-        let backend =
-            healthy_backends[INDEX.fetch_add(1, Ordering::Relaxed) % healthy_backends.len()];
+        let backend = ready_for_use_backends
+            [INDEX.fetch_add(1, Ordering::Relaxed) % ready_for_use_backends.len()];
         println!("routing to: {}", backend.addr);
 
         match connection_pools.get_connection(&backend.addr).await {
@@ -126,6 +128,9 @@ async fn get_connection<'a>(
                     >= MAX_CONSECUTIVE_FAILURES_FOR_A_BACKEND
                 {
                     backend.healthy.store(false, Ordering::Relaxed);
+                    connection_pools
+                        .empty_backend_connections(&backend.addr)
+                        .await
                 }
             }
         };
@@ -146,8 +151,8 @@ async fn handle_connection(
     //note: using BoxBody so I can return Incoming (streaming) to the client, while also being able to return Full responses for stuff like no healthy backend and stuff, which can't be done with Incoming only
     println!("{:?}", req);
 
-    if !backends.iter().any(|b| b.healthy.load(Ordering::Relaxed)) {
-        eprintln!("no healthy backend available");
+    if !backends.iter().any(|b| b.is_enabled_and_healthy()) {
+        eprintln!("no enabled healthy backend available");
         return Ok(error_response(503, "no healthy backend available"));
     }
 
@@ -191,7 +196,7 @@ async fn handle_connection(
         .await
         {
             Ok((sender, backend)) => (Some(sender), Some(backend)),
-            Err(ConnectionError::NoHealthyBackend) => {
+            Err(ConnectionError::NoEnabledHealthyBackend) => {
                 return Ok(error_response(503, "no healthy backend available"));
             }
             Err(ConnectionError::CouldNotConnect) => {
@@ -233,6 +238,9 @@ async fn handle_connection(
                     >= MAX_CONSECUTIVE_FAILURES_FOR_A_BACKEND
                 {
                     backend_healthy.store(false, Ordering::Relaxed);
+                    connection_pools
+                        .empty_backend_connections(backend_addr)
+                        .await
                 }
                 last_error = Some(RequestError::Failed);
             }
@@ -245,6 +253,9 @@ async fn handle_connection(
                     >= MAX_CONSECUTIVE_FAILURES_FOR_A_BACKEND
                 {
                     backend_healthy.store(false, Ordering::Relaxed);
+                    connection_pools
+                        .empty_backend_connections(backend_addr)
+                        .await
                 }
                 last_error = Some(RequestError::TimedOut);
             }
@@ -275,6 +286,58 @@ async fn handle_connection(
     Ok(res.map(|b| b.boxed()))
 }
 
+async fn handle_backend_enabling(backends: Arc<Vec<Backend>>) {
+    let admin_addr = SocketAddr::from(([127, 0, 0, 1], 3001)); //note: must be localhost, so it can only be reachable from within
+    let admin_listener = TcpListener::bind(admin_addr)
+        .await
+        .expect("admin: bind error");
+
+    loop {
+        let mut stream = match admin_listener.accept().await {
+            Ok((stream, _)) => stream,
+            Err(e) => {
+                eprintln!("admin: accept error: {}", e);
+                continue;
+            }
+        };
+
+        let mut buffer = [0u8; 256];
+        let bytes_read = match stream.read(&mut buffer).await {
+            Ok(bytes_read) => bytes_read,
+            Err(e) => {
+                eprintln!("admin: read error: {}", e);
+                continue;
+            }
+        };
+
+        let payload = buffer[..bytes_read].trim_ascii_end();
+        let mut parts = payload.split(|&b| b == b' ');
+        let action = parts.next();
+        let backend_addr = parts.next();
+
+        let response: &[u8] = match (action, backend_addr) {
+            (Some(act), Some(addr)) if act == b"enable" || act == b"disable" => {
+                match backends.iter().find(|b| b.addr.as_bytes() == addr) {
+                    Some(backend) => {
+                        if act == b"enable" {
+                            backend.enable();
+                            b"success: backend enabled"
+                        } else {
+                            backend.disable();
+                            b"success: backend disabled"
+                        }
+                    }
+                    None => b"error: no matching backend found",
+                }
+            }
+            _ => b"error: syntax error",
+        };
+
+        let _ = stream.write_all(response).await;
+        let _ = stream.flush().await;
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let retry_budget = Arc::new(RetryBudget::new(100, 10));
@@ -297,6 +360,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         backends_addresses,
     ));
 
+    tokio::spawn(handle_backend_enabling(Arc::clone(&backends)));
+
     tokio::spawn(start_health_checker(
         Arc::clone(&backends),
         Duration::from_secs(5),
@@ -304,7 +369,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     ));
 
     loop {
-        let (stream, _) = listener.accept().await?;
+        let stream = match listener.accept().await {
+            Ok((stream, _)) => stream,
+            Err(e) => {
+                eprintln!("Accept error: {}", e);
+                continue;
+            }
+        };
         let io = TokioIo::new(stream);
         let backends = Arc::clone(&backends);
         let connection_pools = Arc::clone(&connection_pools);

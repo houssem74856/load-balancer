@@ -6,6 +6,9 @@ pub struct Backend {
     pub addr: String,
     pub healthy: AtomicBool,
     pub consecutive_failures: AtomicU8,
+    pub health_check_consecutive_successes: AtomicU8,
+    pub health_check_consecutive_failures: AtomicU8,
+    pub enabled: AtomicBool,
 }
 
 impl Backend {
@@ -14,6 +17,24 @@ impl Backend {
             addr: addr.into(),
             healthy: AtomicBool::new(true),
             consecutive_failures: AtomicU8::new(0),
+            health_check_consecutive_successes: AtomicU8::new(0),
+            health_check_consecutive_failures: AtomicU8::new(0),
+            enabled: AtomicBool::new(true),
         }
+    }
+
+    pub fn is_enabled_and_healthy(self: &Backend) -> bool {
+        self.enabled.load(std::sync::atomic::Ordering::Relaxed)
+            && self.healthy.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    pub fn enable(self: &Backend) {
+        self.enabled
+            .store(true, std::sync::atomic::Ordering::Relaxed)
+    }
+
+    pub fn disable(self: &Backend) {
+        self.enabled
+            .store(false, std::sync::atomic::Ordering::Relaxed)
     }
 }

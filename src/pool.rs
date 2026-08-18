@@ -39,7 +39,7 @@ impl ConnectionPools {
 
     pub async fn get_connection(
         &self,
-        backend_addr: &String,
+        backend_addr: &str,
     ) -> Result<SendRequest<BoxBody<Bytes, hyper::Error>>, Box<dyn std::error::Error + Send + Sync>>
     {
         let connections_mutex = self.pools.get(backend_addr).unwrap();
