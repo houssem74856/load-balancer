@@ -54,8 +54,13 @@ impl ConnectionPools {
         };
 
         while let Some(mut pooled) = option_pooled_connection {
-            if pooled.sender.ready().await.is_ok() {
-                return Ok(pooled.sender);
+            match pooled.sender.ready().await {
+                Ok(_) => {
+                    return Ok(pooled.sender);
+                }
+                Err(e) => {
+                    eprintln!("sender not ready: {}", e);
+                }
             }
 
             option_pooled_connection = {

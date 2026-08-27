@@ -14,7 +14,7 @@ use hyper::body::Bytes;
 use hyper::client::conn::http1::SendRequest;
 use hyper::server::conn::http1;
 use hyper::service::service_fn;
-use hyper::{Method, Request, Response};
+use hyper::{Method, Request, Response, Version};
 use hyper_util::rt::TokioIo;
 use std::net::SocketAddr;
 use std::println;
@@ -262,7 +262,7 @@ async fn handle_connection(
         };
     }
 
-    let (res, sender, backend_addr) = match res {
+    let (mut res, sender, backend_addr) = match res {
         Some(r) => (r, sender.unwrap(), &backend.as_ref().unwrap().addr),
         None => match last_error.unwrap() {
             RequestError::Failed => {
@@ -277,9 +277,13 @@ async fn handle_connection(
         },
     };
 
-    connection_pools
-        .return_connection(backend_addr, sender)
-        .await;
+    if res.version() != Version::HTTP_10 {
+        connection_pools
+            .return_connection(backend_addr, sender)
+            .await;
+    }
+
+    *res.version_mut() = Version::HTTP_11;
 
     println!("response status: {}", res.status());
 
