@@ -1,4 +1,4 @@
-use std::sync::atomic::{AtomicBool, AtomicU8};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 
 pub const MAX_CONSECUTIVE_FAILURES_FOR_A_BACKEND: u8 = 3;
 
@@ -9,6 +9,25 @@ pub struct Backend {
     pub health_check_consecutive_successes: AtomicU8,
     pub health_check_consecutive_failures: AtomicU8,
     pub enabled: AtomicBool,
+}
+
+impl Clone for Backend {
+    fn clone(&self) -> Self {
+        Self {
+            addr: self.addr.clone(),
+            healthy: AtomicBool::new(self.healthy.load(Ordering::Relaxed)),
+            consecutive_failures: AtomicU8::new(self.consecutive_failures.load(Ordering::Relaxed)),
+            health_check_consecutive_successes: AtomicU8::new(
+                self.health_check_consecutive_successes
+                    .load(Ordering::Relaxed),
+            ),
+            health_check_consecutive_failures: AtomicU8::new(
+                self.health_check_consecutive_failures
+                    .load(Ordering::Relaxed),
+            ),
+            enabled: AtomicBool::new(self.enabled.load(Ordering::Relaxed)),
+        }
+    }
 }
 
 impl Backend {

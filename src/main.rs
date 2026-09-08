@@ -8,6 +8,7 @@ use crate::body::{RequestBody, handle_body};
 use crate::health::start_health_checker;
 use crate::pool::ConnectionPools;
 
+use arc_swap::ArcSwap;
 use http_body_util::Empty;
 use http_body_util::{BodyExt, Full, combinators::BoxBody};
 use hyper::body::Bytes;
@@ -18,8 +19,8 @@ use hyper::{Method, Request, Response, Version};
 use hyper_util::rt::TokioIo;
 use std::net::SocketAddr;
 use std::println;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::io::AsyncReadExt;
 use tokio::io::AsyncWriteExt;
@@ -128,9 +129,7 @@ async fn get_connection<'a>(
                     >= MAX_CONSECUTIVE_FAILURES_FOR_A_BACKEND
                 {
                     backend.healthy.store(false, Ordering::Relaxed);
-                    connection_pools
-                        .empty_backend_connections(&backend.addr)
-                        .await
+                    connection_pools.empty_backend_connections(&backend.addr)
                 }
             }
         };
@@ -238,9 +237,7 @@ async fn handle_connection(
                     >= MAX_CONSECUTIVE_FAILURES_FOR_A_BACKEND
                 {
                     backend_healthy.store(false, Ordering::Relaxed);
-                    connection_pools
-                        .empty_backend_connections(backend_addr)
-                        .await
+                    connection_pools.empty_backend_connections(backend_addr)
                 }
                 last_error = Some(RequestError::Failed);
             }
@@ -253,9 +250,7 @@ async fn handle_connection(
                     >= MAX_CONSECUTIVE_FAILURES_FOR_A_BACKEND
                 {
                     backend_healthy.store(false, Ordering::Relaxed);
-                    connection_pools
-                        .empty_backend_connections(backend_addr)
-                        .await
+                    connection_pools.empty_backend_connections(backend_addr)
                 }
                 last_error = Some(RequestError::TimedOut);
             }
@@ -278,9 +273,7 @@ async fn handle_connection(
     };
 
     if res.version() != Version::HTTP_10 {
-        connection_pools
-            .return_connection(backend_addr, sender)
-            .await;
+        connection_pools.return_connection(backend_addr, sender);
     }
 
     *res.version_mut() = Version::HTTP_11;
@@ -290,7 +283,10 @@ async fn handle_connection(
     Ok(res.map(|b| b.boxed()))
 }
 
-async fn handle_backend_enabling(backends: Arc<Vec<Backend>>) {
+async fn handle_admin_commands(
+    backends: Arc<ArcSwap<Arc<Vec<Backend>>>>,
+    connection_pools: Arc<ConnectionPools>,
+) {
     let admin_addr = SocketAddr::from(([127, 0, 0, 1], 3001)); //note: must be localhost, so it can only be reachable from within
     let admin_listener = TcpListener::bind(admin_addr)
         .await
@@ -304,41 +300,93 @@ async fn handle_backend_enabling(backends: Arc<Vec<Backend>>) {
                 continue;
             }
         };
+        let backends = Arc::clone(&backends);
+        let connection_pools = Arc::clone(&connection_pools);
 
-        let mut buffer = [0u8; 256];
-        let bytes_read = match stream.read(&mut buffer).await {
-            Ok(bytes_read) => bytes_read,
-            Err(e) => {
-                eprintln!("admin: read error: {}", e);
-                continue;
-            }
-        };
+        tokio::spawn(async move {
+            let mut buffer = [0u8; 256];
+            let bytes_read = match stream.read(&mut buffer).await {
+                Ok(bytes_read) => bytes_read,
+                Err(e) => {
+                    eprintln!("admin: read error: {}", e);
+                    return;
+                }
+            };
 
-        let payload = buffer[..bytes_read].trim_ascii_end();
-        let mut parts = payload.split(|&b| b == b' ');
-        let action = parts.next();
-        let backend_addr = parts.next();
+            let payload = buffer[..bytes_read].trim_ascii_end();
+            let mut parts = payload.split(|&b| b == b' ');
+            let action = parts.next();
+            let backend_addr = parts.next();
 
-        let response: &[u8] = match (action, backend_addr) {
-            (Some(act), Some(addr)) if act == b"enable" || act == b"disable" => {
-                match backends.iter().find(|b| b.addr.as_bytes() == addr) {
-                    Some(backend) => {
-                        if act == b"enable" {
-                            backend.enable();
-                            b"success: backend enabled"
+            let response: &[u8] = match (action, backend_addr) {
+                (Some(act), Some(addr))
+                    if act == b"enable" || act == b"disable" || act == b"remove" =>
+                {
+                    let backends_guard = backends.load();
+                    match backends_guard.iter().find(|b| b.addr.as_bytes() == addr) {
+                        Some(backend) => {
+                            if act == b"enable" {
+                                backend.enable();
+                                b"success: backend enabled"
+                            } else if act == b"disable" {
+                                backend.disable();
+                                b"success: backend disabled"
+                            } else {
+                                backends.rcu(|current_backends| {
+                                    let new_backends = current_backends
+                                        .iter()
+                                        .filter(|b| b.addr != backend.addr)
+                                        .cloned()
+                                        .collect::<Vec<_>>();
+
+                                    Arc::new(new_backends)
+                                });
+                                connection_pools.pools.rcu(|current_pools| {
+                                    let mut new_pools = (***current_pools).clone();
+                                    new_pools.remove(&backend.addr);
+
+                                    Arc::new(new_pools)
+                                });
+                                b"success: backend removed"
+                            }
+                        }
+                        None => b"error: no matching backend found",
+                    }
+                }
+                (Some(act), Some(addr)) if act == b"add" => match std::str::from_utf8(addr) {
+                    Ok(addr) => {
+                        let already_exists = backends.load().iter().any(|b| b.addr == addr);
+
+                        if already_exists {
+                            b"error: address exists already"
                         } else {
-                            backend.disable();
-                            b"success: backend disabled"
+                            connection_pools.pools.rcu(|current_pools| {
+                                let mut new_pools = (***current_pools).clone();
+                                new_pools
+                                    .insert(addr.to_string(), Arc::new(Mutex::new(Vec::new())));
+
+                                Arc::new(new_pools)
+                            });
+
+                            backends.rcu(|current_backends| {
+                                let mut new_backends =
+                                    current_backends.iter().cloned().collect::<Vec<_>>();
+                                new_backends.push(Backend::new(addr.to_string()));
+
+                                Arc::new(new_backends)
+                            });
+
+                            b"success: backend added"
                         }
                     }
-                    None => b"error: no matching backend found",
-                }
-            }
-            _ => b"error: syntax error",
-        };
+                    Err(_) => b"error: address syntax error",
+                },
+                _ => b"error: syntax error",
+            };
 
-        let _ = stream.write_all(response).await;
-        let _ = stream.flush().await;
+            let _ = stream.write_all(response).await;
+            let _ = stream.flush().await;
+        });
     }
 }
 
@@ -349,12 +397,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let listener = TcpListener::bind(addr).await?;
 
     let backends_addresses = vec!["localhost:8000", "localhost:8001", "localhost:8002"];
-    let backends = Arc::new(
+    let backends = Arc::new(ArcSwap::from_pointee(Arc::new(
         backends_addresses
             .iter()
             .map(|&addr| Backend::new(addr))
             .collect::<Vec<_>>(),
-    );
+    )));
 
     let max_idle_per_host = 100;
     let idle_timeout = Duration::from_secs(30);
@@ -364,7 +412,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         backends_addresses,
     ));
 
-    tokio::spawn(handle_backend_enabling(Arc::clone(&backends)));
+    tokio::spawn(handle_admin_commands(
+        Arc::clone(&backends),
+        Arc::clone(&connection_pools),
+    ));
 
     tokio::spawn(start_health_checker(
         Arc::clone(&backends),
@@ -389,7 +440,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             let service = service_fn(move |req| {
                 handle_connection(
                     req,
-                    Arc::clone(&backends),
+                    Arc::clone(&backends.load()),
                     Arc::clone(&connection_pools),
                     Arc::clone(&retry_budget),
                 )

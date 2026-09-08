@@ -1,3 +1,4 @@
+use arc_swap::ArcSwap;
 use http_body_util::combinators::BoxBody;
 use hyper::body::Bytes;
 use hyper::client::conn::http1::SendRequest;
@@ -7,13 +8,13 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::net::TcpStream;
 
-struct PooledConnection {
+pub struct PooledConnection {
     sender: SendRequest<BoxBody<Bytes, hyper::Error>>,
     last_used: Instant,
 }
 
 pub struct ConnectionPools {
-    pools: HashMap<String, Arc<Mutex<Vec<PooledConnection>>>>,
+    pub pools: ArcSwap<Arc<HashMap<String, Arc<Mutex<Vec<PooledConnection>>>>>>,
     max_idle_per_host: usize,
     idle_timeout: Duration,
 }
@@ -31,7 +32,7 @@ impl ConnectionPools {
         }
 
         ConnectionPools {
-            pools,
+            pools: ArcSwap::from_pointee(Arc::new(pools)),
             max_idle_per_host,
             idle_timeout,
         }
@@ -42,7 +43,12 @@ impl ConnectionPools {
         backend_addr: &str,
     ) -> Result<SendRequest<BoxBody<Bytes, hyper::Error>>, Box<dyn std::error::Error + Send + Sync>>
     {
-        let connections_mutex = self.pools.get(backend_addr).unwrap();
+        let pools_guard = self.pools.load();
+        let connections_mutex = pools_guard.get(backend_addr).ok_or_else(
+            || -> Box<dyn std::error::Error + Send + Sync> {
+                format!("no connection pool for backend '{}'", backend_addr).into()
+            },
+        )?;
         /*note:
         problem: was holding mutex accross an async call (sender.ready().await) which would block other requests from accessing the vec.
         solution: drop right after poping a connection then testing if it is ready separately if it isn't then reacuire the lock again,
@@ -83,23 +89,25 @@ impl ConnectionPools {
         Ok(sender)
     }
 
-    pub async fn return_connection(
+    pub fn return_connection(
         &self,
         backend_addr: &String,
         sender: SendRequest<BoxBody<Bytes, hyper::Error>>,
     ) {
-        let mut connections = self.pools.get(backend_addr).unwrap().lock().unwrap();
+        if let Some(connections_mutex) = self.pools.load().get(backend_addr) {
+            let mut connections = connections_mutex.lock().unwrap();
 
-        if connections.len() < self.max_idle_per_host {
-            connections.push(PooledConnection {
-                sender,
-                last_used: Instant::now(),
-            });
+            if connections.len() < self.max_idle_per_host {
+                connections.push(PooledConnection {
+                    sender,
+                    last_used: Instant::now(),
+                });
+            }
         }
     }
 
-    pub async fn empty_backend_connections(&self, backend_addr: &String) {
-        if let Some(connections_mutex) = self.pools.get(backend_addr) {
+    pub fn empty_backend_connections(&self, backend_addr: &String) {
+        if let Some(connections_mutex) = self.pools.load().get(backend_addr) {
             let mut connections = connections_mutex.lock().unwrap();
             connections.clear();
         }

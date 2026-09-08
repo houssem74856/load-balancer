@@ -1,5 +1,6 @@
 use crate::{backend::Backend, pool::ConnectionPools};
 
+use arc_swap::ArcSwap;
 use http_body_util::{BodyExt, Empty};
 use hyper::body::{Bytes, Incoming};
 use hyper::{Request, Response};
@@ -55,7 +56,7 @@ async fn http_health_check(backend_addr: &str) -> bool {
 }
 
 pub async fn start_health_checker(
-    backends: Arc<Vec<Backend>>,
+    backends: Arc<ArcSwap<Arc<Vec<Backend>>>>,
     interval: Duration,
     connection_pools: Arc<ConnectionPools>,
 ) {
@@ -66,7 +67,8 @@ pub async fn start_health_checker(
 
         let mut handles = vec![];
 
-        for backend_addr in backends.iter().map(|backend| backend.addr.clone()) {
+        let backends_guard = backends.load();
+        for backend_addr in backends_guard.iter().map(|backend| backend.addr.clone()) {
             let handle = tokio::spawn(async move {
                 let healthy = http_health_check(&backend_addr).await;
 
@@ -76,7 +78,7 @@ pub async fn start_health_checker(
             handles.push(handle);
         }
 
-        for (backend, handle) in backends.iter().zip(handles) {
+        for (backend, handle) in backends_guard.iter().zip(handles) {
             let passed = handle.await.unwrap();
             let was_healthy = backend.healthy.load(Ordering::Relaxed);
             let consecutive_successes = backend
@@ -121,9 +123,7 @@ pub async fn start_health_checker(
                         backend
                             .health_check_consecutive_failures
                             .store(0, Ordering::Relaxed);
-                        connection_pools
-                            .empty_backend_connections(&backend.addr)
-                            .await
+                        connection_pools.empty_backend_connections(&backend.addr)
                     }
                 }
             }
