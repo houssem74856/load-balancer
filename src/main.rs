@@ -65,14 +65,14 @@ impl RetryBudget {
     pub fn deposit(&self) {
         let _ = self
             .tokens
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |t| {
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |t| {
                 Some(t.saturating_add(1).min(self.max_tokens))
             });
     }
 
     pub fn try_withdraw(&self) -> bool {
         self.tokens
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |t| {
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |t| {
                 if t >= self.retry_cost {
                     Some(t - self.retry_cost)
                 } else {
