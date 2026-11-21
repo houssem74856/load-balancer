@@ -388,10 +388,15 @@ async fn handle_admin_commands(
 pub async fn run(
     listener: TcpListener,
     admin_listener: TcpListener,
+    backends_addresses: Vec<String>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let backends_addresses = backends_addresses
+        .iter()
+        .map(String::as_str)
+        .collect::<Vec<_>>();
+
     let retry_budget = Arc::new(RetryBudget::new(100, 10));
 
-    let backends_addresses = vec!["localhost:8000", "localhost:8001", "localhost:8002"];
     let backends = Arc::new(ArcSwap::from_pointee(Arc::new(
         backends_addresses
             .iter()
