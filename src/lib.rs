@@ -43,7 +43,6 @@ const RETRIABLE_METHODS: &[Method] = &[
     Method::PUT,
     Method::DELETE,
 ];
-static INDEX: AtomicUsize = AtomicUsize::new(0);
 const MAX_RETRY_ATTEMPTS_FOR_GET_CONNECTION: u8 = 3;
 
 pub struct RetryBudget {
@@ -92,6 +91,7 @@ async fn get_connection<'a>(
     connection_pools: &ConnectionPools,
     tried_backends: &mut Vec<&'a String>,
     retry_budget: &RetryBudget,
+    index: &AtomicUsize,
 ) -> Result<(SendRequest<BoxBody<Bytes, hyper::Error>>, &'a Backend), ConnectionError> {
     let mut connection_result = None;
     let mut attempt_idx = 0;
@@ -111,7 +111,7 @@ async fn get_connection<'a>(
         }
 
         let backend = ready_for_use_backends
-            [INDEX.fetch_add(1, Ordering::Relaxed) % ready_for_use_backends.len()];
+            [index.fetch_add(1, Ordering::Relaxed) % ready_for_use_backends.len()];
         println!("routing to: {}", backend.addr);
 
         match connection_pools.get_connection(&backend.addr).await {
@@ -145,6 +145,7 @@ async fn handle_connection(
     backends: Arc<Vec<Backend>>,
     connection_pools: Arc<ConnectionPools>,
     retry_budget: Arc<RetryBudget>,
+    index: Arc<AtomicUsize>,
 ) -> Result<Response<BoxBody<Bytes, hyper::Error>>, Box<dyn std::error::Error + Send + Sync>> {
     //note: using BoxBody so I can return Incoming (streaming) to the client, while also being able to return Full responses for stuff like no healthy backend and stuff, which can't be done with Incoming only
     println!("{:?}", req);
@@ -190,6 +191,7 @@ async fn handle_connection(
             &connection_pools,
             &mut tried_backends,
             &retry_budget,
+            &index,
         )
         .await
         {
@@ -395,6 +397,7 @@ pub async fn run(
         .map(String::as_str)
         .collect::<Vec<_>>();
 
+    let index = Arc::new(AtomicUsize::new(0));
     let retry_budget = Arc::new(RetryBudget::new(100, 10));
 
     let backends = Arc::new(ArcSwap::from_pointee(Arc::new(
@@ -436,6 +439,7 @@ pub async fn run(
         let backends = Arc::clone(&backends);
         let connection_pools = Arc::clone(&connection_pools);
         let retry_budget = Arc::clone(&retry_budget);
+        let index = Arc::clone(&index);
 
         tokio::task::spawn(async move {
             let service = service_fn(move |req| {
@@ -444,6 +448,7 @@ pub async fn run(
                     Arc::clone(&backends.load()),
                     Arc::clone(&connection_pools),
                     Arc::clone(&retry_budget),
+                    Arc::clone(&index),
                 )
             });
 
