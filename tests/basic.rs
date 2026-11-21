@@ -6,8 +6,8 @@ use tokio::net::TcpListener;
 
 #[tokio::test]
 async fn round_robin_splits_evenly() {
-    let backend_1 = MockBackend::start("backend_1").await;
-    let backend_2 = MockBackend::start("backend_2").await;
+    let backend_1 = MockBackend::start_a_normal_backend("backend_1").await;
+    let backend_2 = MockBackend::start_a_normal_backend("backend_2").await;
 
     //port 0 means let the os choose any free port, thats why addr is used in the creation of more then one listener
     let addr = SocketAddr::from(([127, 0, 0, 1], 0));
@@ -38,7 +38,7 @@ async fn round_robin_splits_evenly() {
 
 #[tokio::test]
 async fn dead_backend_is_skipped() {
-    let backend_1 = MockBackend::start("backend_1").await;
+    let backend_1 = MockBackend::start_a_normal_backend("backend_1").await;
     //bind to get a free port, then drop the listener so nothing is listening there anymore
     let addr = SocketAddr::from(([127, 0, 0, 1], 0));
     let dead_listener = TcpListener::bind(addr).await.unwrap();

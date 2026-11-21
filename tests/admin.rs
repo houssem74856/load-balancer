@@ -45,8 +45,8 @@ async fn send_requests(lb_addr: SocketAddr, count: usize) {
 
 #[tokio::test]
 async fn disabled_backend_gets_no_traffic_until_reenabled() {
-    let backend_1 = MockBackend::start("backend_1").await;
-    let backend_2 = MockBackend::start("backend_2").await;
+    let backend_1 = MockBackend::start_a_normal_backend("backend_1").await;
+    let backend_2 = MockBackend::start_a_normal_backend("backend_2").await;
 
     let (lb_addr, admin_addr) =
         start_lb(vec![backend_1.address.clone(), backend_2.address.clone()]).await;
@@ -68,7 +68,7 @@ async fn disabled_backend_gets_no_traffic_until_reenabled() {
 
 #[tokio::test]
 async fn all_backends_disabled_returns_503() {
-    let backend_1 = MockBackend::start("backend_1").await;
+    let backend_1 = MockBackend::start_a_normal_backend("backend_1").await;
 
     let (lb_addr, admin_addr) = start_lb(vec![backend_1.address.clone()]).await;
 
@@ -83,8 +83,8 @@ async fn all_backends_disabled_returns_503() {
 
 #[tokio::test]
 async fn added_backend_receives_traffic() {
-    let backend_1 = MockBackend::start("backend_1").await;
-    let backend_2 = MockBackend::start("backend_2").await;
+    let backend_1 = MockBackend::start_a_normal_backend("backend_1").await;
+    let backend_2 = MockBackend::start_a_normal_backend("backend_2").await;
 
     let (lb_addr, admin_addr) = start_lb(vec![backend_1.address.clone()]).await;
 
@@ -101,8 +101,8 @@ async fn added_backend_receives_traffic() {
 
 #[tokio::test]
 async fn removed_backend_stops_receiving_traffic() {
-    let backend_1 = MockBackend::start("backend_1").await;
-    let backend_2 = MockBackend::start("backend_2").await;
+    let backend_1 = MockBackend::start_a_normal_backend("backend_1").await;
+    let backend_2 = MockBackend::start_a_normal_backend("backend_2").await;
 
     let (lb_addr, admin_addr) =
         start_lb(vec![backend_1.address.clone(), backend_2.address.clone()]).await;
