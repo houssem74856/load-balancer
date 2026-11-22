@@ -1,7 +1,7 @@
 #![allow(dead_code)]
 
-use http_body_util::Full;
-use hyper::{Request, Response, body::Bytes, server::conn::http1, service::service_fn};
+use http_body_util::{BodyExt, Full};
+use hyper::{Request, Response, StatusCode, body::Bytes, server::conn::http1, service::service_fn};
 use hyper_util::rt::TokioIo;
 use std::{
     net::SocketAddr,
@@ -17,6 +17,8 @@ enum Behavior {
     Normal,
     Close,
     Hang,
+    Echo,
+    Status(u16),
 }
 
 async fn handle_connection(
@@ -33,6 +35,24 @@ async fn handle_connection(
             Behavior::Normal => {}
             Behavior::Close => return Err("closing connection on purpose".into()),
             Behavior::Hang => std::future::pending().await,
+            Behavior::Echo => {
+                //sends back the body, and the x-echo header if there is one
+                let echo_header = req.headers().get("x-echo").cloned();
+                let body = req.into_body().collect().await?.to_bytes();
+
+                let mut res = Response::new(Full::new(body));
+                if let Some(value) = echo_header {
+                    res.headers_mut().insert("x-echo", value);
+                }
+
+                return Ok(res);
+            }
+            Behavior::Status(code) => {
+                let mut res = Response::new(Full::new(Bytes::from(name)));
+                *res.status_mut() = StatusCode::from_u16(code).unwrap();
+
+                return Ok(res);
+            }
         }
     }
 
@@ -59,6 +79,14 @@ impl MockBackend {
 
     pub async fn start_a_hanging_backend(name: &'static str) -> Self {
         Self::start(name, Behavior::Hang).await
+    }
+
+    pub async fn start_an_echo_backend(name: &'static str) -> Self {
+        Self::start(name, Behavior::Echo).await
+    }
+
+    pub async fn start_a_backend_with_status(name: &'static str, status: u16) -> Self {
+        Self::start(name, Behavior::Status(status)).await
     }
 
     async fn start(name: &'static str, behavior: Behavior) -> Self {
