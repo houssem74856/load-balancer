@@ -1,24 +1,9 @@
 mod common;
 
-use common::MockBackend;
-use std::net::SocketAddr;
-use tokio::net::TcpListener;
+use common::{MockBackend, start_lb, start_lb_with_config};
+use load_balancer::Config;
 
-async fn start_lb(backends_addresses: Vec<String>) -> SocketAddr {
-    let addr = SocketAddr::from(([127, 0, 0, 1], 0));
-    let lb_listener = TcpListener::bind(addr).await.unwrap();
-    let admin_listener = TcpListener::bind(addr).await.unwrap();
-
-    let lb_addr = lb_listener.local_addr().unwrap();
-
-    tokio::spawn(load_balancer::run(
-        lb_listener,
-        admin_listener,
-        backends_addresses,
-    ));
-
-    lb_addr
-}
+use std::time::Duration;
 
 fn total_attempts(backends: &[MockBackend]) -> usize {
     backends.iter().map(|b| b.request_count()).sum()
@@ -112,7 +97,11 @@ async fn retries_stop_when_retry_budget_is_exhausted() {
 async fn hanging_backend_returns_504() {
     let hanging_backend = MockBackend::start_a_hanging_backend("hanging_backend").await;
 
-    let lb_addr = start_lb(vec![hanging_backend.address.clone()]).await;
+    let config = Config {
+        request_timeout: Duration::from_millis(200),
+        ..Config::default()
+    };
+    let (lb_addr, _) = start_lb_with_config(vec![hanging_backend.address.clone()], config).await;
 
     let client = reqwest::Client::new();
     let res = client

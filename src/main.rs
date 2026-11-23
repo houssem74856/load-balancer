@@ -1,3 +1,5 @@
+use load_balancer::Config;
+
 use std::net::SocketAddr;
 use tokio::net::TcpListener;
 
@@ -15,5 +17,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         "localhost:8002".to_string(),
     ];
 
-    load_balancer::run(listener, admin_listener, backends_addresses).await
+    load_balancer::run(
+        Config::default(),
+        listener,
+        admin_listener,
+        backends_addresses,
+    )
+    .await
 }

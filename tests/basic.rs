@@ -1,6 +1,7 @@
 mod common;
 
-use common::MockBackend;
+use common::{MockBackend, start_lb};
+
 use std::net::SocketAddr;
 use tokio::net::TcpListener;
 
@@ -9,18 +10,7 @@ async fn round_robin_splits_evenly() {
     let backend_1 = MockBackend::start_a_normal_backend("backend_1").await;
     let backend_2 = MockBackend::start_a_normal_backend("backend_2").await;
 
-    //port 0 means let the os choose any free port, thats why addr is used in the creation of more then one listener
-    let addr = SocketAddr::from(([127, 0, 0, 1], 0));
-    let lb_listener = TcpListener::bind(addr).await.unwrap();
-    let admin_listener = TcpListener::bind(addr).await.unwrap();
-
-    let lb_addr = lb_listener.local_addr().unwrap();
-
-    tokio::spawn(load_balancer::run(
-        lb_listener,
-        admin_listener,
-        vec![backend_1.address.clone(), backend_2.address.clone()],
-    ));
+    let lb_addr = start_lb(vec![backend_1.address.clone(), backend_2.address.clone()]).await;
 
     let client = reqwest::Client::new();
     for _ in 0..10 {
@@ -45,16 +35,7 @@ async fn dead_backend_is_skipped() {
     let dead_address = dead_listener.local_addr().unwrap().to_string();
     drop(dead_listener);
 
-    let lb_listener = TcpListener::bind(addr).await.unwrap();
-    let admin_listener = TcpListener::bind(addr).await.unwrap();
-
-    let lb_addr = lb_listener.local_addr().unwrap();
-
-    tokio::spawn(load_balancer::run(
-        lb_listener,
-        admin_listener,
-        vec![dead_address, backend_1.address.clone()],
-    ));
+    let lb_addr = start_lb(vec![dead_address, backend_1.address.clone()]).await;
 
     let client = reqwest::Client::new();
     for _ in 0..10 {

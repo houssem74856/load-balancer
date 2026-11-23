@@ -25,6 +25,21 @@ use tokio::io::AsyncReadExt;
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpListener;
 
+#[derive(Debug, Clone)]
+pub struct Config {
+    pub health_check_interval: Duration,
+    pub request_timeout: Duration,
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Config {
+            health_check_interval: Duration::from_secs(5),
+            request_timeout: Duration::from_secs(5),
+        }
+    }
+}
+
 fn error_response(status: u16, msg: &str) -> Response<BoxBody<Bytes, hyper::Error>> {
     Response::builder()
         .status(status)
@@ -146,6 +161,7 @@ async fn handle_connection(
     connection_pools: Arc<ConnectionPools>,
     retry_budget: Arc<RetryBudget>,
     index: Arc<AtomicUsize>,
+    request_timeout: Duration,
 ) -> Result<Response<BoxBody<Bytes, hyper::Error>>, Box<dyn std::error::Error + Send + Sync>> {
     //note: using BoxBody so I can return Incoming (streaming) to the client, while also being able to return Full responses for stuff like no healthy backend and stuff, which can't be done with Incoming only
     println!("{:?}", req);
@@ -218,11 +234,8 @@ async fn handle_connection(
         let backend_consecutive_failures = &backend.as_ref().unwrap().consecutive_failures;
         let backend_healthy = &backend.as_ref().unwrap().healthy;
 
-        match tokio::time::timeout(
-            Duration::from_secs(5),
-            sender.as_mut().unwrap().send_request(req),
-        )
-        .await
+        match tokio::time::timeout(request_timeout, sender.as_mut().unwrap().send_request(req))
+            .await
         {
             Ok(Ok(r)) => {
                 res = Some(r);
@@ -388,6 +401,7 @@ async fn handle_admin_commands(
 }
 
 pub async fn run(
+    config: Config,
     listener: TcpListener,
     admin_listener: TcpListener,
     backends_addresses: Vec<String>,
@@ -423,7 +437,7 @@ pub async fn run(
 
     tokio::spawn(start_health_checker(
         Arc::clone(&backends),
-        Duration::from_secs(5),
+        config.health_check_interval,
         Arc::clone(&connection_pools),
     ));
 
@@ -449,6 +463,7 @@ pub async fn run(
                     Arc::clone(&connection_pools),
                     Arc::clone(&retry_budget),
                     Arc::clone(&index),
+                    config.request_timeout,
                 )
             });
 

@@ -1,25 +1,14 @@
 mod common;
 
-use common::MockBackend;
+use common::{MockBackend, start_lb_with_config};
+use load_balancer::Config;
+
 use std::net::SocketAddr;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream};
+use tokio::net::TcpStream;
 
 async fn start_lb(backends_addresses: Vec<String>) -> (SocketAddr, SocketAddr) {
-    let addr = SocketAddr::from(([127, 0, 0, 1], 0));
-    let lb_listener = TcpListener::bind(addr).await.unwrap();
-    let admin_listener = TcpListener::bind(addr).await.unwrap();
-
-    let lb_addr = lb_listener.local_addr().unwrap();
-    let admin_addr = admin_listener.local_addr().unwrap();
-
-    tokio::spawn(load_balancer::run(
-        lb_listener,
-        admin_listener,
-        backends_addresses,
-    ));
-
-    (lb_addr, admin_addr)
+    start_lb_with_config(backends_addresses, Config::default()).await
 }
 
 async fn send_admin_command(admin_addr: SocketAddr, command: &str) -> String {

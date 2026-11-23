@@ -1,26 +1,10 @@
 mod common;
 
-use common::MockBackend;
+use common::{MockBackend, start_lb};
+
 use reqwest::Method;
-use std::net::SocketAddr;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream};
-
-async fn start_lb(backends_addresses: Vec<String>) -> SocketAddr {
-    let addr = SocketAddr::from(([127, 0, 0, 1], 0));
-    let lb_listener = TcpListener::bind(addr).await.unwrap();
-    let admin_listener = TcpListener::bind(addr).await.unwrap();
-
-    let lb_addr = lb_listener.local_addr().unwrap();
-
-    tokio::spawn(load_balancer::run(
-        lb_listener,
-        admin_listener,
-        backends_addresses,
-    ));
-
-    lb_addr
-}
+use tokio::net::TcpStream;
 
 #[tokio::test]
 async fn request_body_arrives_intact() {
